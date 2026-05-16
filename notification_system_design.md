@@ -166,3 +166,68 @@ SET is_deleted = TRUE
 WHERE id = 'N98214' 
   AND user_id = 'U1023';
 ```
+
+---
+
+## Stage 3: Query Optimization & Performance Analysis
+
+### Analyzing the Problematic Query
+**Original Query:**
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt DESC;
+```
+
+#### Why it becomes slow at scale:
+Without appropriate indexes, the database must perform a **Full Table Scan**, examining every single row in the millions-large `notifications` table to check the `studentID` and `isRead` conditions. After finding the rows, it must perform an expensive, memory-intensive sorting operation for the `ORDER BY createdAt DESC` clause before returning data.
+
+#### Why `SELECT *` is inefficient:
+`SELECT *` forces the database to retrieve every column from disk into memory, including potentially large payload bodies or unused metadata. This unnecessarily spikes memory consumption, increases disk I/O operations, and bloats network payload latency. Explicitly selecting only required columns is highly recommended.
+
+#### Why indexing every column is a bad idea:
+**Write Penalty & Storage Bloat:** While indexes speed up reads, they drastically slow down writes. Every `INSERT`, `UPDATE`, or `DELETE` to the `notifications` table forces the database engine to synchronously update every single index attached to those columns. Over-indexing creates severe write latency and doubles/triples storage costs.
+
+---
+
+### Recommended Optimization Strategy
+
+#### 1. Proper Indexing Strategy: Composite Indexes
+A **Composite Index** is an index that spans multiple columns. By ordering the columns correctly inside the index structure, the database can simultaneously filter the data and instantly return it in sorted order without doing an in-memory sort.
+
+**Recommended Index:**
+```sql
+CREATE INDEX idx_student_unread_date ON notifications (studentID, isRead, createdAt DESC);
+```
+**Mechanism:** The engine jumps directly to the node for `studentID = 1042`, filters down the continuous block of `isRead = false`, and reads them out natively sorted by `createdAt DESC`.
+
+#### 2. The Optimized Query
+```sql
+SELECT id, title, type, createdAt 
+FROM notifications
+WHERE studentID = 1042 
+  AND isRead = false 
+  AND createdAt < '2026-05-16T10:00:00Z' -- Keysets/Cursor logic
+ORDER BY createdAt DESC
+LIMIT 20;
+```
+
+#### 3. Pagination Approach (Cursor-Based)
+*   **Avoid `OFFSET`:** `OFFSET 1000` forces the database to physically scan and discard 1,000 rows.
+*   **Use Cursor Pagination:** Using `WHERE createdAt < last_seen_timestamp` combined with a `LIMIT` leverages the composite index to fetch the exact next block of 20 rows in $O(1)$ lookup time, regardless of how deep the user scrolls.
+
+#### 4. Caching Considerations
+*   **Unread Badge Counts:** Counting unread notifications via SQL is expensive at high volumes. Store the `unread_count` per student in an in-memory cache like **Redis**.
+*   **Invalidation Flow:** Increment the Redis key when a new notification is fired; decrement it when a notification is marked read. The actual database is only queried when the student explicitly opens their notification tray.
+
+---
+
+### Additional Query: Recent Placement Notifications
+**Task:** Find all students who received "placement" notifications in the last 7 days.
+```sql
+SELECT DISTINCT studentID
+FROM notifications
+WHERE type = 'placement'
+  AND createdAt >= NOW() - INTERVAL '7 days';
+```
+*(Note: To execute this efficiently at scale, a secondary composite index on `(type, createdAt)` would be required).*
