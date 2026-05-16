@@ -231,3 +231,44 @@ WHERE type = 'placement'
   AND createdAt >= NOW() - INTERVAL '7 days';
 ```
 *(Note: To execute this efficiently at scale, a secondary composite index on `(type, createdAt)` would be required).*
+
+---
+
+## Stage 4: High-Load Performance & Scalability
+
+When the notification system experiences heavy traffic (e.g., a massive campus-wide broadcast causing thousands of simultaneous database queries), the database can become a severe bottleneck. Below are practical strategies to alleviate database pressure and maintain system speed.
+
+### 1. Redis Caching
+Instead of repeatedly hitting the PostgreSQL database to calculate the "Unread Count" every time a student loads a page, we cache this value in Redis.
+*   **Mechanism:** Store a key like `unread:U1023` mapped to an integer. Increment it on new notifications; decrement when a notification is read.
+*   **Tradeoffs:** 
+    *   *Pros:* Eliminates over 80% of database read load, as the unread badge is the most frequently requested data. Responses are sub-millisecond.
+    *   *Cons:* Introduces cache invalidation complexity. If Redis crashes, the cache must be rebuilt from the primary database.
+
+### 2. Pagination / Lazy Loading
+We never send all historical notifications to the client at once. 
+*   **Mechanism:** We implement **Cursor-Based Pagination** to send data in small chunks (e.g., 20 at a time). When the user scrolls to the bottom of the list, the frontend requests the next batch using the `createdAt` timestamp of the last viewed notification.
+*   **Tradeoffs:**
+    *   *Pros:* Keeps memory usage low on both the server and client, drastically reducing network payloads and database scan times.
+    *   *Cons:* Slightly more complex to implement on the frontend and backend compared to basic `OFFSET` pagination.
+
+### 3. Server-Sent Events (SSE) vs. WebSockets
+Instead of having thousands of clients constantly sending HTTP requests (polling) to check for new notifications, we stream updates to them.
+*   **Mechanism:** We utilize **Server-Sent Events (SSE)** because notifications are fundamentally a unidirectional flow (Server ➔ Client).
+*   **Tradeoffs:**
+    *   *Pros:* Eliminates empty polling requests that exhaust database connections. SSE is drastically lighter on server memory than maintaining full, stateful two-way WebSocket connections.
+    *   *Cons:* Requires long-lived HTTP connections, which can consume proxy or load balancer connection limits if not tuned properly.
+
+### 4. Read Replicas
+When `SELECT` queries overwhelm the database (e.g., thousands of students opening their notification trays simultaneously), we scale horizontally.
+*   **Mechanism:** Deploy a primary PostgreSQL instance dedicated to writes (`INSERT`, `UPDATE`), and asynchronously stream data to multiple Read Replica instances. All `GET` requests are routed exclusively to the replicas.
+*   **Tradeoffs:**
+    *   *Pros:* Linearly scales read capacity without blocking critical write operations.
+    *   *Cons:* Introduces **replication lag**. A user might mark a notification as read (hitting the primary), immediately refresh the page (hitting a replica), and temporarily see it as unread.
+
+### 5. Archival of Old Notifications
+Notification tables grow infinitely. Queries against massive tables degrade over time, even with proper indexes.
+*   **Mechanism:** Run a nightly automated job to move notifications older than 6 months from the hot `notifications` table into a separate `notifications_archive` table, or use PostgreSQL's native table partitioning by date.
+*   **Tradeoffs:**
+    *   *Pros:* Keeps the primary table extremely lean, meaning active indexes fit entirely into RAM, ensuring blazing-fast reads.
+    *   *Cons:* If a user attempts to view a 2-year-old notification, the application logic must intelligently query the slower archive table.
