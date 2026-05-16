@@ -272,3 +272,42 @@ Notification tables grow infinitely. Queries against massive tables degrade over
 *   **Tradeoffs:**
     *   *Pros:* Keeps the primary table extremely lean, meaning active indexes fit entirely into RAM, ensuring blazing-fast reads.
     *   *Cons:* If a user attempts to view a 2-year-old notification, the application logic must intelligently query the slower archive table.
+
+---
+
+## Stage 5: Large-Scale Asynchronous Processing
+
+Sending a campus-wide broadcast to 50,000 students synchronously (e.g., looping through 50,000 records and firing database inserts/email requests in a single HTTP request) will lead to severe API timeouts, exhausted memory, and blocked server threads. **Asynchronous processing** is completely mandatory to decouple the immediate API response from the heavy workload of delivery.
+
+### Architecture Components
+
+#### 1. Message Queues (e.g., RabbitMQ, AWS SQS)
+Instead of processing immediately, the `POST /api/notifications/send` API instantly pushes a single "broadcast job" payload into a Message Queue and immediately returns a `202 Accepted` response.
+*   **Role:** Acts as a highly durable buffer. It securely holds the jobs until backend worker processes are ready to handle them, ensuring no broadcasts are lost during traffic spikes.
+
+#### 2. Worker Processes & Batching
+Independent backend Node.js worker instances continually listen to the queue.
+*   **Role:** A worker pulls the broadcast job, fetches the target 50,000 `studentIDs`, and breaks them into manageable chunks (e.g., batches of 1,000).
+*   **Batching:** It executes bulk `INSERT` statements into PostgreSQL (to create the in-app notifications) and triggers bulk email API requests, drastically reducing database round-trips.
+
+### Handling Failures & Fault Tolerance
+
+#### 3. Retry Mechanisms & Exponential Backoff
+If an external email provider's API goes down or rate-limits our requests, the worker must not silently fail and discard the batch.
+*   **Exponential Backoff:** The worker catches the failure and requeues the specific batch with an exponentially increasing delay (e.g., retry in 2s, then 4s, then 8s). This ensures eventual delivery without aggressively hammering a struggling third-party service.
+
+#### 4. Dead-Letter Queues (DLQ)
+If a specific batch fails repeatedly (e.g., exceeding 5 retries due to a permanently invalid payload or hard API rejection), it is routed to a **Dead-Letter Queue**.
+*   **Role:** The DLQ acts as a quarantine zone. It ensures the main queue doesn't get clogged with unprocessable "poison" messages, allowing developers to manually inspect and replay the failed jobs later.
+
+### Observability & Integration
+
+#### 5. Logging and Monitoring (Integration)
+To maintain total visibility into this distributed, multi-stage process, we integrate our custom **`Log()` middleware** across the entire pipeline:
+
+*   **API Layer:** `Log('backend', 'info', 'api', 'Broadcast triggered for 50k users')`
+*   **Worker Layer:** `Log('worker', 'info', 'queue-processor', 'Batch 1/50 processed successfully')`
+*   **Failure Catching:** `Log('worker', 'error', 'email-service', 'SendGrid timeout, retrying in 4s...')`
+*   **DLQ Routing:** `Log('worker', 'warn', 'dlq-router', 'Batch permanently failed, moved to DLQ')`
+
+By centralizing these logs, we achieve high fault tolerance. If a worker process unexpectedly crashes mid-execution, the queue will safely reassign the unacknowledged batch to another healthy worker. Meanwhile, the logging middleware ensures developers can instantly track where bottlenecks or failures occurred during the massive 50k broadcast.
